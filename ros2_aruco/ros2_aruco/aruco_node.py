@@ -2,8 +2,7 @@
 This node locates Aruco AR markers in images and publishes their ids and poses.
 
 Subscriptions:
-   /camera/image_raw (sensor_msgs.msg.Image)
-   /camera/camera_info (sensor_msgs.msg.CameraInfo)
+   /camera/image_raw (sensor_msgs.msg.Image or sensor_msgs.msg.CompressedImage)
    /camera/camera_info (sensor_msgs.msg.CameraInfo)
 
 Published Topics:
@@ -21,6 +20,8 @@ Parameters:
     image_topic - image topic to subscribe to (default /camera/image_raw)
     camera_info_topic - camera info topic to subscribe to
                          (default /camera/camera_info)
+    camera_frame - camera optical frame to use (default: use frame from camera_info)
+    image_message_type - image message type: 'Image' or 'CompressedImage' (default 'Image')
 
 Author: Nathan Sprague
 Version: 10/26/2020
@@ -35,7 +36,7 @@ import numpy as np
 import cv2
 import tf_transformations
 from sensor_msgs.msg import CameraInfo
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from geometry_msgs.msg import PoseArray, Pose
 from ros2_aruco_interfaces.msg import ArucoMarkers
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
@@ -91,6 +92,15 @@ class ArucoNode(rclpy.node.Node):
             ),
         )
 
+        self.declare_parameter(
+            name="image_message_type",
+            value="Image",
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_STRING,
+                description="Image message type: 'Image' or 'CompressedImage'.",
+            ),
+        )
+
         self.marker_size = (
             self.get_parameter("marker_size").get_parameter_value().double_value
         )
@@ -115,6 +125,19 @@ class ArucoNode(rclpy.node.Node):
             self.get_parameter("camera_frame").get_parameter_value().string_value
         )
 
+        self.image_message_type = (
+            self.get_parameter("image_message_type").get_parameter_value().string_value
+        )
+        self.get_logger().info(f"Image message type: {self.image_message_type}")
+
+        # Validate image message type
+        if self.image_message_type not in ["Image", "CompressedImage"]:
+            self.get_logger().error(
+                f"Invalid image_message_type: {self.image_message_type}. "
+                "Valid options are: 'Image' or 'CompressedImage'"
+            )
+            raise ValueError(f"Invalid image_message_type: {self.image_message_type}")
+
         # Make sure we have a valid dictionary id:
         try:
             dictionary_id = cv2.aruco.__getattribute__(dictionary_id_name)
@@ -132,9 +155,20 @@ class ArucoNode(rclpy.node.Node):
             CameraInfo, info_topic, self.info_callback, qos_profile_sensor_data
         )
 
-        self.create_subscription(
-            Image, image_topic, self.image_callback, qos_profile_sensor_data
-        )
+        # Create appropriate image subscription based on message type
+        if self.image_message_type == "Image":
+            self.create_subscription(
+                Image, image_topic, self.image_callback, qos_profile_sensor_data
+            )
+        elif self.image_message_type == "CompressedImage":
+            self.create_subscription(
+                CompressedImage, image_topic, self.compressed_image_callback, qos_profile_sensor_data
+            )
+        else:
+            raise ValueError(
+                f"Invalid image_message_type: {self.image_message_type}. "
+                "Valid options are: 'Image' or 'CompressedImage'"
+            )
 
         # Set up publishers
         self.poses_pub = self.create_publisher(PoseArray, "aruco_poses", 10)
@@ -162,6 +196,17 @@ class ArucoNode(rclpy.node.Node):
             return
 
         cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="mono8")
+        self.process_image(cv_image, img_msg.header.stamp)
+
+    def compressed_image_callback(self, img_msg):
+        if self.info_msg is None:
+            self.get_logger().warn("No camera info has been received!")
+            return
+
+        cv_image = self.bridge.compressed_imgmsg_to_cv2(img_msg, desired_encoding="mono8")
+        self.process_image(cv_image, img_msg.header.stamp)
+
+    def process_image(self, cv_image, timestamp):
         markers = ArucoMarkers()
         pose_array = PoseArray()
         if self.camera_frame == "":
@@ -171,8 +216,8 @@ class ArucoNode(rclpy.node.Node):
             markers.header.frame_id = self.camera_frame
             pose_array.header.frame_id = self.camera_frame
 
-        markers.header.stamp = img_msg.header.stamp
-        pose_array.header.stamp = img_msg.header.stamp
+        markers.header.stamp = timestamp
+        pose_array.header.stamp = timestamp
 
         corners, marker_ids, rejected = cv2.aruco.detectMarkers(
             cv_image, self.aruco_dictionary, parameters=self.aruco_parameters
